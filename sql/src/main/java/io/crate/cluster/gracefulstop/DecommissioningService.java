@@ -23,13 +23,13 @@
 package io.crate.cluster.gracefulstop;
 
 import com.google.common.annotations.VisibleForTesting;
+import io.crate.action.FutureActionListener;
 import io.crate.action.sql.SQLOperations;
 import io.crate.execution.engine.collect.stats.JobsLogs;
 import io.crate.execution.jobs.TasksService;
 import io.crate.settings.CrateSetting;
 import io.crate.types.DataTypes;
 import org.apache.lucene.util.Constants;
-import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.action.admin.cluster.health.ClusterHealthRequest;
 import org.elasticsearch.action.admin.cluster.health.ClusterHealthResponse;
 import org.elasticsearch.action.admin.cluster.health.TransportClusterHealthAction;
@@ -56,6 +56,7 @@ import sun.misc.SignalHandler;
 import javax.annotation.Nullable;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -201,54 +202,29 @@ public class DecommissioningService extends AbstractLifecycleComponent implement
         removeRemovedNodes(event);
     }
 
-    private void decommission() {
+    private CompletableFuture<Void> decommission() {
         // fail on new requests so that clients don't use this node anymore
         sqlOperations.disable();
 
-        /*
-         * setting this setting will cause the {@link DecommissionAllocationDecider} to prevent allocations onto this node
-         *
-         * nodeIds are part of the key to prevent conflicts if other nodes are being decommissioned in parallel
-         */
         Settings settings = Settings.builder().put(
             DECOMMISSION_PREFIX + clusterService.localNode().getId(), true).build();
-        updateSettingsAction.execute(new ClusterUpdateSettingsRequest().transientSettings(settings), new ActionListener<ClusterUpdateSettingsResponse>() {
-            @Override
-            public void onResponse(ClusterUpdateSettingsResponse clusterUpdateSettingsResponse) {
-                // changing settings triggers AllocationService.reroute -> shards will be relocated
 
-                // NOTE: it waits for ALL relocating shards, not just those that involve THIS node.
-                ClusterHealthRequest request = new ClusterHealthRequest()
-                    .waitForNoRelocatingShards(true)
-                    .waitForEvents(Priority.LANGUID)
-                    .timeout(gracefulStopTimeout);
-
-                if (dataAvailability == DataAvailability.FULL) {
-                    request = request.waitForGreenStatus();
-                } else {
-                    request = request.waitForYellowStatus();
-                }
-
-                final long startTime = System.nanoTime();
-
-                healthAction.execute(request, new ActionListener<ClusterHealthResponse>() {
-                    @Override
-                    public void onResponse(ClusterHealthResponse clusterHealthResponse) {
-                        executorService.submit(() -> exitIfNoActiveRequests(startTime));
-                    }
-
-                    @Override
-                    public void onFailure(Exception e) {
-                        executorService.submit(() -> forceStopOrAbort(e));
-                    }
-                });
-            }
-
-            @Override
-            public void onFailure(Exception e) {
+        return clusterUpdateSettings(settings)
+            .exceptionally(e -> {
                 logger.error("Couldn't set settings. Graceful shutdown failed", e);
-            }
-        });
+                return null;
+            })
+            // changing settings triggers AllocationService.reroute -> shards will be relocated
+            .thenCompose(r -> clusterHealthGet())
+            .handle((res, error) -> {
+                if (error == null) {
+                    final long startTime = System.nanoTime();
+                    executorService.submit(() -> exitIfNoActiveRequests(startTime));
+                } else {
+                    executorService.submit(() -> forceStopOrAbort(error));
+                }
+                return null;
+            });
     }
 
     void forceStopOrAbort(@Nullable Throwable e) {
@@ -275,6 +251,36 @@ public class DecommissioningService extends AbstractLifecycleComponent implement
         logger.info("There are still active requests on this node, delaying graceful shutdown");
         // use scheduler instead of busy loop to avoid blocking a listener thread
         executorService.schedule(() -> exitIfNoActiveRequests(startTime), 5, TimeUnit.SECONDS);
+    }
+
+    private CompletableFuture<ClusterUpdateSettingsResponse> clusterUpdateSettings(final Settings settings) {
+        /*
+         * setting this setting will cause the {@link DecommissionAllocationDecider} to prevent allocations onto this node
+         *
+         * nodeIds are part of the key to prevent conflicts if other nodes are being decommissioned in parallel
+         */
+        FutureActionListener<ClusterUpdateSettingsResponse, ClusterUpdateSettingsResponse> settingsResponseFutureListener
+            = FutureActionListener.newInstance();
+        updateSettingsAction.execute(new ClusterUpdateSettingsRequest().transientSettings(settings), settingsResponseFutureListener);
+        return settingsResponseFutureListener;
+    }
+
+    private CompletableFuture<ClusterHealthResponse> clusterHealthGet() {
+        // NOTE: it waits for ALL relocating shards, not just those that involve THIS node.
+        ClusterHealthRequest request = new ClusterHealthRequest()
+            .waitForNoRelocatingShards(true)
+            .waitForEvents(Priority.LANGUID)
+            .timeout(gracefulStopTimeout);
+
+        if (dataAvailability == DataAvailability.FULL) {
+            request = request.waitForGreenStatus();
+        } else {
+            request = request.waitForYellowStatus();
+        }
+
+        FutureActionListener<ClusterHealthResponse, ClusterHealthResponse> listener = FutureActionListener.newInstance();
+        healthAction.execute(request, listener);
+        return listener;
     }
 
     void exit() {
@@ -304,12 +310,11 @@ public class DecommissioningService extends AbstractLifecycleComponent implement
         handle();
     }
 
-    public void handle() {
+    public CompletableFuture<Void> handle() {
         if (dataAvailability == DataAvailability.NONE) {
             exit();
-        } else {
-            decommission();
         }
+        return decommission();
     }
 
     private void setGracefulStopTimeout(TimeValue gracefulStopTimeout) {
